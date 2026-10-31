@@ -2,13 +2,13 @@
 
 import time
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QEventPoint, QGuiApplication, QPainter, QPainterPath, QPen, QRegion)
 from PySide6.QtWidgets import QWidget
 
 from . import layershell
 from .layershell import ANCHOR_BOTTOM, ANCHOR_LEFT, ANCHOR_RIGHT, ANCHOR_TOP
-from .log import debug
+from .log import debug, log
 
 PAD, GAP = 6, 6          # panel padding and spacing between items (logical px)
 GRIP_LEN, GRIP_W = 20, 44  # the grip has extra touch slop around it (see _item_at)
@@ -16,6 +16,7 @@ KEY_MIN = 42              # smallest Backspace/Return diameter (logical px)
 ACTIVE = QColor("#da4453")  # Breeze "negative" red
 ALL_EDGES = ANCHOR_TOP | ANCHOR_BOTTOM | ANCHOR_LEFT | ANCHOR_RIGHT
 QWIDGETSIZE_MAX = (1 << 24) - 1
+PULSE_MS, PULSE_PERIOD_MS = 50, 1200
 TAP_SLOP = 8  # px a grip press may move and still count as a tap (opens settings)
 KEY_NAMES = {"backspace": "KEY_BACKSPACE", "enter": "KEY_ENTER"}  # "enter" is shown as Return
 
@@ -123,8 +124,9 @@ class FloatingButton(QWidget):
         self._drag_start = None
         self._drag_moved = False
         self._phase = 0.0
-        self._anim = QVariantAnimation(self, startValue=0.0, endValue=1.0, duration=1200, loopCount=-1)
-        self._anim.valueChanged.connect(self._tick)
+        self._pulse = QTimer(self, interval=PULSE_MS, timeout=self._tick)  # ~20 fps is plenty for a pulse
+        self._system_move_save = QTimer(self, singleShot=True, interval=400, timeout=self._save_window_position)
+        self._system_moving = False
         self._drag_timeout = QTimer(self, singleShot=True, interval=60_000, timeout=lambda: self.end_drag(False))
         self._return_timer = QTimer(self, singleShot=True, timeout=self._return_long_press)
         self._resize()
@@ -133,13 +135,14 @@ class FloatingButton(QWidget):
             try:
                 self.layer = layershell.LayerWindow(self)
             except RuntimeError as exc:
-                print("flow-float: layer-shell unavailable, using a normal window:", exc)
+                log("layer-shell unavailable, using a normal window:", exc)
         self.apply_position()
         settings.changed.connect(self._on_setting)
 
     # -- geometry -----------------------------------------------------------
-    def _layout(self, origin=QPointF(0, 0)):
+    def _layout(self, origin=None):
         """Rects of the panel and each item, plus the dock's compact size."""
+        origin = origin if origin is not None else QPointF(0, 0)
         s = self.settings
         d = s.get("size")
         k = max(KEY_MIN, round(d * 0.72))  # Backspace/Return: smaller than the mic, still finger-sized
@@ -212,9 +215,6 @@ class FloatingButton(QWidget):
     def _begin_drag(self, pos):
         self._drag_start = pos
         self._drag_moved = False
-        if not self.layer:  # X11 fallback: let the window manager move us
-            self.windowHandle().startSystemMove()
-            return
         self.dragging = True
         self._drag_ready = False
         self._drag_grab = pos
@@ -292,9 +292,17 @@ class FloatingButton(QWidget):
             if any(t != "grip" for t in self._targets.values()):
                 self._targets.pop(tid)  # don't move the dock out from under another finger
                 return
+            if not self.layer:
+                # No layer-shell (X11 etc.): the window manager moves us and keeps the
+                # release event, so forget the press now and save where we end up.
+                self._targets.pop(tid)
+                self._system_moving = True
+                self.windowHandle().startSystemMove()
+                return
             self._begin_drag(pos)
         elif item == "mic":
-            self._mic_down()
+            if list(self._targets.values()).count("mic") == 1:  # a second finger changes nothing
+                self._mic_down()
         elif item == "enter":
             # Return fires on release: a tap is Return, a long press is Shift+Return.
             self.keys_down.add(item)
@@ -320,7 +328,8 @@ class FloatingButton(QWidget):
         if item == "grip":
             self.end_drag(True)
         elif item == "mic":
-            self._mic_up()
+            if "mic" not in self._targets.values():  # the last finger on the mic lifted
+                self._mic_up()
         elif item == "enter" and item in self.keys_down:
             self.keys_down.discard(item)
             if self._return_timer.isActive():  # released before the long press kicked in
@@ -427,15 +436,33 @@ class FloatingButton(QWidget):
     def _set_active(self, on):
         self.active = on
         if on:
-            self._anim.start()
+            self._pulse.start()
         else:
-            self._anim.stop()
+            self._pulse.stop()
             self._phase = 0.0
         self.update()
 
-    def _tick(self, v):
-        self._phase = v
+    def _tick(self):
+        self._phase = (self._phase + PULSE_MS / PULSE_PERIOD_MS) % 1.0
         self.update()
+
+    def moveEvent(self, ev):
+        super().moveEvent(ev)
+        if self._system_moving:
+            self._system_move_save.start()
+
+    def _save_window_position(self):
+        """Fallback path: store where the window manager left us as corner + margins."""
+        self._system_moving = False
+        area = (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        g = self.frameGeometry()
+        left = g.center().x() < area.center().x()
+        top = g.center().y() < area.center().y()
+        s = self.settings
+        s.set("corner_h", "left" if left else "right")
+        s.set("corner_v", "top" if top else "bottom")
+        s.set("margin_h", max(0, g.left() - area.left() if left else area.right() - g.right()))
+        s.set("margin_v", max(0, g.top() - area.top() if top else area.bottom() - g.bottom()))
 
     def paintEvent(self, ev):
         p = QPainter(self)

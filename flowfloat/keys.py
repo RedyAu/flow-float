@@ -22,6 +22,7 @@ import evdev
 from evdev import ecodes as e
 
 DEVICE_NAME = "Flow Float virtual keyboard"
+MAX_KEY_DELAY_MS = 50  # delays run on the GUI thread; keep them short
 WISPR_CONFIG = Path.home() / ".config" / "Wispr Flow" / "config.json"
 
 MODIFIERS = [  # (label, evdev name) - offered as toggle buttons in the settings
@@ -104,15 +105,25 @@ def wispr_shortcuts():
     return out
 
 
+_helper_pids = []  # cached Wispr Flow helper PIDs; rescanned only when they are gone
+
+
+def _is_wispr_helper(pid):
+    try:
+        # " (deleted)" appears when Wispr Flow was updated while running.
+        return os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)").endswith("wispr-flow-linux-helper")
+    except OSError:
+        return False
+
+
 def _wispr_helper_inputs():
     """Event nodes opened by running Wispr Flow helpers, or None if no helper runs."""
+    global _helper_pids
+    if not _helper_pids or not all(_is_wispr_helper(p) for p in _helper_pids):
+        _helper_pids = [p for p in filter(str.isdigit, os.listdir("/proc")) if _is_wispr_helper(p)]
     found = None
-    for pid in filter(str.isdigit, os.listdir("/proc")):
+    for pid in _helper_pids:
         try:
-            # " (deleted)" appears when Wispr Flow was updated while running.
-            exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
-            if not exe.endswith("wispr-flow-linux-helper"):
-                continue
             fds = os.listdir(f"/proc/{pid}/fd")
         except OSError:
             continue
@@ -157,20 +168,33 @@ class KeyHolder:
         """Human readable description of what press() would do right now."""
         kind, path = self._route(backend, [])
         if kind == "uinput":
-            return f"Virtual keyboard ({self.uinput_path})"
+            text = f"Virtual keyboard ({self.uinput_path})"
+            listened = _wispr_helper_inputs()
+            if backend == "auto" and listened is not None and self.uinput_path not in listened:
+                text += " (Wispr Flow has no keyboard to inject into, so this may not reach it)"
+            return text
         if kind == "inject":
             try:
                 name = evdev.InputDevice(path).name
             except OSError:
                 name = "?"
-            return f"Injecting into {path} ({name}) - the device Wispr Flow listens to"
+            return f"Injecting into {path} ({name}), a keyboard Wispr Flow reads"
+        if backend == "uinput":
+            return "Virtual keyboard unavailable: " + (self.uinput_error or "?")
+        if backend == "inject":
+            return "No writable keyboard device to inject into"
         return "No way to send keys: " + (self.uinput_error or "no writable keyboard")
 
     def _route(self, backend, codes):
-        listened = _wispr_helper_inputs() if backend in ("auto", "inject") else None
-        use_uinput = backend == "uinput" or (
-            backend == "auto" and (listened is None or self.uinput_path in listened))
-        if use_uinput and self.ensure_uinput():
+        """Pick ("uinput" | "inject", device path) or (None, None).
+
+        Only "auto" falls back from one method to the other; an explicit choice
+        either works or reports an error.
+        """
+        if backend == "uinput":
+            return ("uinput", self.uinput_path) if self.ensure_uinput() else (None, None)
+        listened = _wispr_helper_inputs()
+        if backend == "auto" and (listened is None or self.uinput_path in listened) and self.ensure_uinput():
             return "uinput", self.uinput_path
         candidates = sorted(listened or ()) or sorted(evdev.list_devices())
         for path in candidates:
@@ -184,7 +208,7 @@ class KeyHolder:
                 continue
             if e.KEY_A in supported and all(c in supported for c in codes):
                 return "inject", path
-        if self.ensure_uinput():
+        if backend == "auto" and self.ensure_uinput():
             return "uinput", self.uinput_path
         return None, None
 
@@ -202,13 +226,14 @@ class KeyHolder:
 
     def press(self, names, backend="auto", delay_ms=10):
         """Press the given keys in order and keep them down. Returns an error string or None."""
+        delay_ms = min(delay_ms, MAX_KEY_DELAY_MS)
         self.release()
         codes = [e.ecodes[n] for n in names if n in e.ecodes]
         if not codes:
             return "No key combination configured"
         kind, path = self._route(backend, codes)
         if kind is None:
-            return "Cannot send key events: " + (self.uinput_error or "no writable keyboard device")
+            return self.describe_route(backend)
         try:
             if kind == "inject":
                 self._inject_dev = evdev.InputDevice(path)
@@ -224,6 +249,7 @@ class KeyHolder:
         return None
 
     def release(self, delay_ms=10):
+        delay_ms = min(delay_ms, MAX_KEY_DELAY_MS)
         while self._held:
             code = self._held.pop()
             try:
