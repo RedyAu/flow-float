@@ -3,6 +3,27 @@
 > [!NOTE]
 > This is a vibe-coded project, written with an AI coding assistant and tested only on one machine. It is provided as is, without any warranty or support: use it at your own risk. The author takes no responsibility for anything it does to your system.
 
+<p align="center">
+  <img src="data/flow-float.svg" alt="Flow Float logo" width="112">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/dock.png" alt="The dock: idle, listening, with Backspace pressed, and in vertical layout" width="480">
+</p>
+
+<table>
+  <tr>
+    <td><img src="docs/screenshots/settings-general.png" alt="Settings: General"></td>
+    <td><img src="docs/screenshots/settings-shortcut.png" alt="Settings: Shortcut"></td>
+    <td><img src="docs/screenshots/settings-dock.png" alt="Settings: Dock"></td>
+  </tr>
+  <tr>
+    <td align="center">General</td>
+    <td align="center">Shortcut</td>
+    <td align="center">Dock</td>
+  </tr>
+</table>
+
 A floating push-to-talk dock for [Wispr Flow](https://wisprflow.ai) on KDE Plasma (Wayland), for when there's no keyboard, e.g. a convertible in tablet mode.
 
 Flow Float takes over KDE's **virtual keyboard** slot. Whenever a text field gets focus, you get a small dock instead of the on-screen keyboard:
