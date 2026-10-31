@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialogButtonBox, QFormLayo
 from . import kde, keys
 
 ROW_H = 40  # touch-friendly control height
+ADVANCED_PAGE = 3
 
 
 def _tall(widget, h=ROW_H):
@@ -67,8 +68,9 @@ class Page(QScrollArea):
 
 
 class ConfigWindow(QWidget):
-    def __init__(self, settings, holder, running_as_im=False):
+    def __init__(self, settings, holder, running_as_im=False, tablet=None):
         super().__init__()
+        self.tablet = tablet
         self.settings = settings
         self.holder = holder
         self.running_as_im = running_as_im
@@ -92,6 +94,7 @@ class ConfigWindow(QWidget):
             self.nav.addItem(item)
             self.pages.addWidget(page)
         self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.nav.currentRowChanged.connect(lambda _row: self._refresh_status())
         self.nav.setCurrentRow(0)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -116,9 +119,11 @@ class ConfigWindow(QWidget):
         foot.addWidget(buttons)
         root.addLayout(foot)
 
-        self._route_timer = QTimer(self, interval=2000, timeout=self._refresh_status)
+        # Only the Advanced page shows live state worth polling.
+        self._route_timer = QTimer(self, interval=3000, timeout=self._refresh_route)
+        self._own_change = False
         self.load()
-        settings.changed.connect(lambda _k: self.load())
+        settings.changed.connect(self._on_setting_changed)
 
     # -- pages --------------------------------------------------------------
     def _general_page(self):
@@ -128,7 +133,7 @@ class ConfigWindow(QWidget):
         page.full(self.kb_status)
         self.kb_use = _tall(QPushButton(QIcon.fromTheme("input-keyboard-virtual"),
                                         "Use Flow Float as the virtual keyboard"), 44)
-        self.kb_use.clicked.connect(lambda: (kde.use_flow_float(self.settings), self._refresh_status()))
+        self.kb_use.clicked.connect(self._use_flow_float)
         self.kb_restore = _tall(QPushButton(QIcon.fromTheme("edit-undo"), ""), 44)
         self.kb_restore.clicked.connect(lambda: (kde.restore_previous(self.settings), self._refresh_status()))
         row = QHBoxLayout()
@@ -146,30 +151,32 @@ class ConfigWindow(QWidget):
         self.tablet_only = QCheckBox("Only in tablet mode")
         self.tablet_only.toggled.connect(lambda on: self._set("tablet_only", on))
         page.row("", self.tablet_only)
+        self.tablet_note = _note("This device has no tablet mode, so the dock shows regardless.")
+        page.row("", self.tablet_note)
         page.gap()
 
         self.autostart = QCheckBox("Start Flow Float when I log in")
         self.autostart.toggled.connect(lambda on: self._loading or kde.set_autostart(on))
         page.row("Login:", self.autostart)
-        page.row("", _note("Not needed while Flow Float is the virtual keyboard: KWin starts it then."))
+        self.autostart_note = _note("Not needed while Flow Float is the virtual keyboard: KWin starts it then.")
+        page.row("", self.autostart_note)
         return page
 
     def _shortcut_page(self):
         page = Page("Shortcut")
-        self.wispr = keys.wispr_shortcuts()
-        if self.wispr:
-            self.wispr_combo = _tall(QComboBox())
-            for action, combo in self.wispr.items():
-                self.wispr_combo.addItem(f"{keys.WISPR_ACTIONS.get(action, action)}  ({keys.combo_label(combo)})",
-                                         action)
-            self.wispr_combo.setCurrentIndex(max(0, self.wispr_combo.findData("ptt")))
-            use = _tall(QPushButton("Use"))
-            use.clicked.connect(lambda: self.settings.set("combo", self.wispr[self.wispr_combo.currentData()]))
-            row = QHBoxLayout()
-            row.addWidget(self.wispr_combo, 1)
-            row.addWidget(use)
-            page.row("Wispr Flow shortcut:", _wrap(row))
-            page.gap()
+        self._shortcut_form = page.form
+        self.wispr = {}
+        self.wispr_combo = _tall(QComboBox())
+        use = _tall(QPushButton("Use"))
+        use.clicked.connect(lambda: self.wispr_combo.currentData() in self.wispr and
+                            self.settings.set("combo", self.wispr[self.wispr_combo.currentData()]))
+        row = QHBoxLayout()
+        row.addWidget(self.wispr_combo, 1)
+        row.addWidget(use)
+        self.wispr_row = _wrap(row)
+        page.row("Wispr Flow shortcut:", self.wispr_row)
+        self.wispr_gap = _separator()
+        page.full(self.wispr_gap)
 
         mods = QHBoxLayout()
         self.mod_buttons = {}
@@ -265,7 +272,7 @@ class ConfigWindow(QWidget):
         self.max_hold = _tall(QSpinBox(minimum=10, maximum=3600, singleStep=30, suffix=" s"))
         self.max_hold.valueChanged.connect(lambda v: self._set("max_hold_s", v))
         page.row("Release automatically after:", self.max_hold)
-        self.delay = _tall(QSpinBox(minimum=0, maximum=200, singleStep=5, suffix=" ms"))
+        self.delay = _tall(QSpinBox(minimum=0, maximum=keys.MAX_KEY_DELAY_MS, singleStep=5, suffix=" ms"))
         self.delay.valueChanged.connect(lambda v: self._set("key_delay_ms", v))
         page.row("Delay between keys:", self.delay)
         return page
@@ -273,7 +280,34 @@ class ConfigWindow(QWidget):
     # -- data flow ----------------------------------------------------------
     def _set(self, key, value):
         if not self._loading:
-            self.settings.set(key, value)
+            self._own_change = True
+            try:
+                self.settings.set(key, value)
+            finally:
+                self._own_change = False
+
+    def _on_setting_changed(self, _key):
+        # Our own controls already show the new value; reload only for outside changes.
+        if not self._own_change:
+            self.load()
+
+    def _use_flow_float(self):
+        kde.use_flow_float(self.settings, reopen_settings=not self.running_as_im)
+        self._refresh_status()
+        if not self.running_as_im:
+            self.kb_status.setText("Switching… KWin is starting Flow Float as the virtual keyboard. "
+                                   "This window will reopen in a moment.")
+
+    def _refresh_wispr(self):
+        self.wispr = keys.wispr_shortcuts()
+        current = self.wispr_combo.currentData() or "ptt"
+        self.wispr_combo.clear()
+        for action, combo in self.wispr.items():
+            self.wispr_combo.addItem(f"{keys.WISPR_ACTIONS.get(action, action)}  ({keys.combo_label(combo)})",
+                                     action)
+        self.wispr_combo.setCurrentIndex(max(0, self.wispr_combo.findData(current)))
+        for w in (self.wispr_row, self.wispr_gap):  # hide the rows when Wispr Flow isn't set up
+            self._shortcut_form.setRowVisible(w, bool(self.wispr))
 
     def _combo_edited(self):
         if self._loading:
@@ -281,7 +315,8 @@ class ConfigWindow(QWidget):
         combo = [n for _, n in keys.MODIFIERS if self.mod_buttons[n].isChecked()]
         if self.key_combo.currentData():
             combo.append(self.key_combo.currentData())
-        self.settings.set("combo", combo)
+        self._set("combo", combo)
+        self.combo_label.setText(keys.combo_label(combo))
 
     def load(self):
         s = self.settings
@@ -310,8 +345,14 @@ class ConfigWindow(QWidget):
         finally:
             self._loading = False
 
+    def _refresh_route(self):
+        if self.pages.currentIndex() == ADVANCED_PAGE:
+            self.route.setText(self.holder.describe_route(self.settings.get("backend")))
+
     def _refresh_status(self):
-        self.route.setText(self.holder.describe_route(self.settings.get("backend")))
+        self._refresh_route()
+        self.tablet_note.setVisible(self.tablet is not None and not self.tablet.available
+                                    and self.settings.get("tablet_only"))
         current = kde.current_input_method()
         ours = current == str(kde.DESKTOP_FILE)
         prev = self.settings.get("previous_im") or kde.PLASMA_KEYBOARD
@@ -323,11 +364,15 @@ class ConfigWindow(QWidget):
             self.kb_status.setText(f"KDE's virtual keyboard is currently <b>{kde.input_method_name(current)}</b>. "
                                    "Make Flow Float the virtual keyboard so the dock appears exactly when a "
                                    "text field has focus.")
+        # KWin starts the virtual keyboard itself; a login autostart would only compete with it.
+        self.autostart.setEnabled(not ours)
+        self.autostart_note.setVisible(ours)
         self.kb_use.setVisible(not ours)
         self.kb_restore.setVisible(ours)
         self.kb_restore.setText(f"Switch back to {kde.input_method_name(prev)}")
 
     def showEvent(self, ev):
+        self._refresh_wispr()
         self.load()
         self._refresh_status()
         self._route_timer.start()

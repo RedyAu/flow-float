@@ -1,6 +1,6 @@
 """Settings, stored in ~/.config/flowfloat/flowfloat.conf."""
 
-from PySide6.QtCore import QObject, QSettings, Signal
+from PySide6.QtCore import QObject, QSettings, QTimer, Signal
 
 from . import keys
 
@@ -23,6 +23,7 @@ DEFAULTS = {
     "margin_h": 32,
     "margin_v": 160,
     "previous_im": "",            # virtual keyboard to restore, e.g. Plasma Keyboard
+    "reopen_settings": False,     # show settings once KWin has started the new copy
     "first_run": True,
 }
 
@@ -32,14 +33,21 @@ _TYPES = {k: type(v) for k, v in DEFAULTS.items()}
 class Settings(QObject):
     changed = Signal(str)  # key name
 
-    def __init__(self):
+    def __init__(self, path=None):
         super().__init__()
-        self._qs = QSettings("flowfloat", "flowfloat")  # -> ~/.config/flowfloat/flowfloat.conf
+        # Default: ~/.config/flowfloat/flowfloat.conf. ``path`` is for tests.
+        self._qs = (QSettings(str(path), QSettings.Format.IniFormat) if path
+                    else QSettings("flowfloat", "flowfloat"))
+        # Writes reach the disk shortly after the last change (sliders send many).
+        self._sync = QTimer(self, singleShot=True, interval=500, timeout=self._qs.sync)
+        for stale in set(self._qs.allKeys()) - set(DEFAULTS):  # e.g. "mode" from older versions
+            self._qs.remove(stale)
         if self.get("first_run"):
             wispr = keys.wispr_shortcuts().get("ptt")
             if wispr:
                 self._qs.setValue("combo", wispr)
             self._qs.setValue("first_run", False)
+        self._qs.sync()
 
     def get(self, key):
         default = DEFAULTS[key]
@@ -60,10 +68,16 @@ class Settings(QObject):
         if self.get(key) == value:
             return
         self._qs.setValue(key, value)
-        self._qs.sync()
+        self._sync.start()
         self.changed.emit(key)
 
     def reset(self, *names):
         for n in names:
-            self._qs.remove(n)
-            self.changed.emit(n)
+            if self._qs.contains(n):
+                self._qs.remove(n)
+                self._sync.start()
+                self.changed.emit(n)
+
+    def flush(self):
+        self._sync.stop()
+        self._qs.sync()

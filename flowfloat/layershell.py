@@ -28,24 +28,33 @@ def _load():
         _lib = False
         return None
 
+    # Mangled names, enum values and argument layouts below were checked against
+    # LayerShellQt 6.7 (Plasma 6.7). If the ABI drifts, we fall back to a normal window.
     def fn(name, *args):
         f = getattr(lib, name)
         f.argtypes = [ctypes.c_void_p, *args]
         f.restype = None
         return f
 
-    lib.get = lib._ZN12LayerShellQt6Window3getEP7QWindow
-    lib.get.argtypes = [ctypes.c_void_p]
-    lib.get.restype = ctypes.c_void_p
-    lib.setLayer = fn("_ZN12LayerShellQt6Window8setLayerENS0_5LayerE", ctypes.c_int)
-    # QFlags<Anchor> is a trivially copyable int wrapper -> passed as int.
-    lib.setAnchors = fn("_ZN12LayerShellQt6Window10setAnchorsE6QFlagsINS0_6AnchorEE", ctypes.c_int)
-    lib.setMargins = fn("_ZN12LayerShellQt6Window10setMarginsERK8QMargins", ctypes.POINTER(ctypes.c_int * 4))
-    lib.setDesiredSize = fn("_ZN12LayerShellQt6Window14setDesiredSizeERK5QSize", ctypes.POINTER(ctypes.c_int * 2))
-    lib.setExclusiveZone = fn("_ZN12LayerShellQt6Window16setExclusiveZoneEi", ctypes.c_int)
-    lib.setKeyboardInteractivity = fn(
-        "_ZN12LayerShellQt6Window24setKeyboardInteractivityENS0_21KeyboardInteractivityE", ctypes.c_int)
-    lib.setActivateOnShow = fn("_ZN12LayerShellQt6Window17setActivateOnShowEb", ctypes.c_bool)
+    try:
+        lib.get = lib._ZN12LayerShellQt6Window3getEP7QWindow
+        lib.get.argtypes = [ctypes.c_void_p]
+        lib.get.restype = ctypes.c_void_p
+        lib.setLayer = fn("_ZN12LayerShellQt6Window8setLayerENS0_5LayerE", ctypes.c_int)
+        # QFlags<Anchor> is a trivially copyable int wrapper -> passed as int.
+        lib.setAnchors = fn("_ZN12LayerShellQt6Window10setAnchorsE6QFlagsINS0_6AnchorEE", ctypes.c_int)
+        lib.setMargins = fn("_ZN12LayerShellQt6Window10setMarginsERK8QMargins", ctypes.POINTER(ctypes.c_int * 4))
+        lib.setDesiredSize = fn("_ZN12LayerShellQt6Window14setDesiredSizeERK5QSize",
+                                ctypes.POINTER(ctypes.c_int * 2))
+        lib.setExclusiveZone = fn("_ZN12LayerShellQt6Window16setExclusiveZoneEi", ctypes.c_int)
+        lib.setKeyboardInteractivity = fn(
+            "_ZN12LayerShellQt6Window24setKeyboardInteractivityENS0_21KeyboardInteractivityE", ctypes.c_int)
+        lib.setActivateOnShow = fn("_ZN12LayerShellQt6Window17setActivateOnShowEb", ctypes.c_bool)
+    except AttributeError as exc:  # a symbol is missing: different LayerShellQt ABI
+        from .log import log
+        log("LayerShellQt symbols not found, using a normal window:", exc)
+        _lib = False
+        return None
     _lib = lib
     return lib
 

@@ -40,9 +40,13 @@ The dock never takes keyboard focus. It's a layer-shell overlay, so the text fie
 ./install.sh
 ```
 
-The script checks dependencies (`python3-pyside6`, `python3-evdev`, `layer-shell-qt`), installs `~/.local/share/applications/flow-float.desktop` and points KWin's virtual keyboard at it. You can also pick it by hand under *System Settings → Keyboard → Virtual Keyboard → Flow Float*. KWin starts and stops Flow Float itself from then on.
+The script checks dependencies (Python 3.9+, `python3-pyside6`, `python3-evdev`, `layer-shell-qt`), installs `~/.local/share/applications/flow-float.desktop` and points KWin's virtual keyboard at it. The desktop file points at this checkout, so run `./install.sh` again if you move the folder. You can also pick it by hand under *System Settings → Keyboard → Virtual Keyboard → Flow Float*. KWin starts and stops Flow Float itself from then on.
 
-To go back to the normal on-screen keyboard, use *Switch back to Plasma Keyboard* in the settings or the tray menu.
+To go back to the normal on-screen keyboard, use *Switch back to Plasma Keyboard* in the settings or the tray menu. To remove Flow Float completely, which restores the previous keyboard and deletes the desktop files, run:
+
+```bash
+./install.sh --uninstall
+```
 
 ## Settings
 
@@ -51,8 +55,9 @@ Open the settings by tapping the dock's grip, clicking the tray icon, or running
 - the key combination (pick one of Wispr Flow's shortcuts or build your own)
 - the latch delay (how short a tap must be to latch; Off = always push-to-talk)
 - which keys the dock shows, its layout (vertical or horizontal), size and opacity
-- whether the dock appears only in tablet mode (on by default)
+- whether the dock appears only in tablet mode (on by default; ignored on devices without a tablet mode)
 - start at login. Only needed if you use "Always" without making Flow Float the virtual keyboard.
+- a safety limit (Advanced, 5 minutes by default) after which held or latched keys are released, with a notification
 
 The settings window has four pages: General, Shortcut, Dock and Advanced. Settings are stored in `~/.config/flowfloat/flowfloat.conf`, and the log is in `~/.cache/flowfloat/flowfloat.log`.
 
@@ -64,6 +69,14 @@ Wispr Flow's helper reads `/dev/input/event*` directly. Flow Float sends the sho
 
 - The dock only appears for apps that use Wayland text input: Qt, GTK and Firefox do. Chromium and Electron apps (Chrome, Slack, VS Code…) need `--enable-wayland-ime` to report text focus, which is the same limitation Plasma's own keyboard has. For those, set *Show the dock* to *Always*.
 - While Flow Float is the virtual keyboard there is no on-screen keyboard for typing.
+
+## Development
+
+```bash
+pip install pytest ruff
+pytest      # runs without a display
+ruff check .
+```
 
 ## License
 

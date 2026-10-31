@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 from PySide6.QtCore import SLOT, QObject, QTimer, Slot
 from PySide6.QtDBus import QDBusConnection, QDBusInterface
@@ -31,15 +32,23 @@ class TabletMode(QObject):
         super().__init__()
         self.on_change = on_change
         self.active = False
+        self.available = False  # devices without a tablet-mode switch never enter tablet mode
         bus = QDBusConnection.sessionBus()
         iface = QDBusInterface(*KWIN, bus)
         if iface.isValid():
             self.active = bool(iface.property("tabletMode"))
+            self.available = bool(iface.property("tabletModeAvailable"))
         bus.connect(*KWIN, "tabletModeChanged", self, SLOT("changed(bool)"))
+        bus.connect(*KWIN, "tabletModeAvailableChanged", self, SLOT("available_changed(bool)"))
 
     @Slot(bool)
     def changed(self, on):
         self.active = on
+        self.on_change()
+
+    @Slot(bool)
+    def available_changed(self, on):
+        self.available = on
         self.on_change()
 
 
@@ -52,6 +61,8 @@ class FlowFloat(QObject):
         self.user_hidden = False
         self.config = None
         self.text_focus = False
+        self._shut_down = False
+        self._key_error_shown = False  # notify about failing keys once, until a press works again
 
         self.im = None
         if im_fd is not None:
@@ -59,6 +70,9 @@ class FlowFloat(QObject):
             self.im = InputMethod(im_fd)
             self.im.focus_changed.connect(self._on_text_focus)
             log("running as KWin input method")
+            if kde.autostart_enabled():  # KWin starts us now; a login copy would only compete
+                kde.set_autostart(False)
+                log("removed the login autostart entry")
 
         self.button = FloatingButton(self.settings)
         self.button.pressed.connect(self._on_press)
@@ -67,13 +81,17 @@ class FlowFloat(QObject):
         self.button.key_event.connect(self._on_key)
         self.button.drag_finished.connect(self.update_visibility)
         self.button.settings_requested.connect(self.show_settings)
-        self.watchdog = QTimer(self, singleShot=True, timeout=self.button.force_release)
+        self.watchdog = QTimer(self, singleShot=True, timeout=self._watchdog_fired)
         self.hide_timer = QTimer(self, singleShot=True, interval=HIDE_DELAY_MS, timeout=self.update_visibility)
+        self.busy_retry = QTimer(self, singleShot=True, interval=500, timeout=self.update_visibility)
 
         self.tablet = TabletMode(self.update_visibility)
         self.settings.changed.connect(lambda k: k in ("show_when", "tablet_only") and self.update_visibility())
         self._make_tray()
         self.update_visibility()
+        if self.im is not None and self.settings.get("reopen_settings"):
+            self.settings.set("reopen_settings", False)
+            QTimer.singleShot(300, self.show_settings)
 
         if self.im is None and self.settings.get("show_when") == "text" and not kde.is_our_input_method():
             self.notify("Flow Float is not your virtual keyboard yet",
@@ -133,10 +151,10 @@ class FlowFloat(QObject):
         s = self.settings
         wanted = (not self.user_hidden
                   and (s.get("show_when") == "always" or self.text_focus)
-                  and (not s.get("tablet_only") or self.tablet.active))
-        # Never pull the button out from under a finger.
+                  and (not s.get("tablet_only") or not self.tablet.available or self.tablet.active))
+        # Never pull the dock out from under a finger; look again shortly.
         if not wanted and self.button.busy:
-            QTimer.singleShot(500, self.update_visibility)
+            self.busy_retry.start()
             return
         if wanted != self.button.isVisible():
             self.button.setVisible(wanted)
@@ -147,7 +165,8 @@ class FlowFloat(QObject):
     # -- actions ------------------------------------------------------------
     def show_settings(self):
         if self.config is None:
-            self.config = ConfigWindow(self.settings, self.holder, running_as_im=self.im is not None)
+            self.config = ConfigWindow(self.settings, self.holder, running_as_im=self.im is not None,
+                                       tablet=self.tablet)
         self.config.show()
         self.config.raise_()
         self.config.activateWindow()
@@ -157,15 +176,30 @@ class FlowFloat(QObject):
         err = self.holder.press(s.get("combo"), s.get("backend"), s.get("key_delay_ms"))
         if err:
             self.button.force_release()
-            self.notify("Flow Float could not press the keys", err)
+            self._key_error("Flow Float could not press the keys", err)
             return
+        self._key_error_shown = False
         log("holding", keys.combo_label(s.get("combo")), "via", self.holder.backend_used)
         self.watchdog.start(s.get("max_hold_s") * 1000)
+
+    def _watchdog_fired(self):
+        minutes = self.settings.get("max_hold_s") / 60
+        log("watchdog released the keys")
+        self.button.force_release()
+        self.notify("Flow Float released the keys",
+                    f"They were held for {minutes:g} min, the limit set in Settings → Advanced.")
 
     def _on_key(self, name, down):
         err = self.holder.key(name, down)
         if err and down:
-            self.notify("Flow Float could not press the key", err)
+            self._key_error("Flow Float could not press the key", err)
+        elif down:
+            self._key_error_shown = False
+
+    def _key_error(self, title, text):
+        if not self._key_error_shown:
+            self._key_error_shown = True
+            self.notify(title, text)
 
     def _on_release(self):
         self.watchdog.stop()
@@ -177,8 +211,13 @@ class FlowFloat(QObject):
          "quit": self.app.quit}.get(cmd, self.show_settings)()
 
     def shutdown(self):
+        """Release everything. Runs once, from aboutToQuit while Qt objects still exist."""
+        if self._shut_down:
+            return
+        self._shut_down = True
         self.button.release_all()
         self.holder.close()
+        self.settings.flush()
 
 
 def _send(cmd):
@@ -201,6 +240,8 @@ def main():
     g.add_argument("--quit", dest="cmd", action="store_const", const="quit", help="quit the running instance")
     g.add_argument("--background", dest="cmd", action="store_const", const="ping",
                    help="start without opening anything (used at login)")
+    g.add_argument("--uninstall", dest="cmd", action="store_const", const="uninstall",
+                   help="restore the previous virtual keyboard and remove Flow Float's desktop files")
     args = ap.parse_args()
 
     # When KWin starts us as the virtual keyboard it hands over a private Wayland
@@ -208,7 +249,10 @@ def main():
     im_fd = os.environ.pop("WAYLAND_SOCKET", None)
     if im_fd is not None:
         im_fd = int(im_fd)
-        os.environ.setdefault("WAYLAND_DISPLAY", "wayland-0")
+        if not os.environ.get("WAYLAND_DISPLAY"):
+            runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+            sockets = sorted(p.name for p in Path(runtime).glob("wayland-[0-9]") if p.is_socket())
+            os.environ["WAYLAND_DISPLAY"] = sockets[0] if sockets else "wayland-0"
 
     app = QApplication(sys.argv)
     app.setApplicationName("flow-float")
@@ -217,6 +261,15 @@ def main():
     app.setWindowIcon(QIcon(str(kde.ICON)))
     app.setQuitOnLastWindowClosed(False)
 
+    if args.cmd == "uninstall":
+        _send("quit")
+        settings = Settings()
+        kde.uninstall(settings)
+        settings.flush()
+        print("Flow Float removed. Virtual keyboard:", kde.input_method_name(kde.current_input_method()))
+        return 0
+
+    server = QLocalServer()
     if im_fd is None:
         # Forward to a running instance. "ping" (--background) just checks it is there.
         if _send(args.cmd or "settings"):
@@ -225,18 +278,28 @@ def main():
             return 0
         if args.cmd == "ping":
             args.cmd = None
-    elif _send("quit"):
+        # Claim the socket before building anything. If another copy got there in
+        # the meantime it answers and we leave; otherwise the socket file is stale.
+        if not server.listen(SOCKET):
+            if _send(args.cmd or "ping"):
+                return 0
+            QLocalServer.removeServer(SOCKET)
+            if not server.listen(SOCKET):
+                log("cannot listen on the command socket:", server.errorString())
+                return 1
+    else:
         # The copy KWin starts must win: KWin talks only to it.
-        for _ in range(30):
-            time.sleep(0.1)
-            if not _send("ping"):
-                break
+        if _send("quit"):
+            for _ in range(30):
+                time.sleep(0.1)
+                if not _send("ping"):
+                    break
+        QLocalServer.removeServer(SOCKET)
+        if not server.listen(SOCKET):
+            log("cannot listen on the command socket:", server.errorString())
 
     kde.install_desktop_file()
     ff = FlowFloat(app, im_fd)
-    server = QLocalServer()
-    QLocalServer.removeServer(SOCKET)
-    server.listen(SOCKET)
 
     def on_conn():
         c = server.nextPendingConnection()
@@ -250,8 +313,8 @@ def main():
     server.newConnection.connect(on_conn)
 
     # Never leave keys stuck down.
-    atexit.register(ff.shutdown)
     app.aboutToQuit.connect(ff.shutdown)
+    atexit.register(ff.holder.close)  # last resort if Qt never got to aboutToQuit
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: app.quit())
     tick = QTimer(interval=300)  # lets Python run its signal handlers

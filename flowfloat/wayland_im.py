@@ -15,11 +15,13 @@ import struct
 
 from PySide6.QtCore import QObject, QSocketNotifier, Signal
 
-from .log import debug, log
+from .log import log
 
 DISPLAY_ID = 1
-# Text-input content purposes we stay hidden for.
+# Fields we stay hidden in: the password purpose, or the hidden-text / sensitive-data hints.
 PURPOSE_PASSWORD = 8
+HINT_HIDDEN_TEXT = 0x40
+HINT_SENSITIVE_DATA = 0x80
 
 
 def _string(s):
@@ -67,7 +69,7 @@ class InputMethod(QObject):
 
     def _read(self):
         try:
-            data, ancdata, _flags, _addr = self.sock.recvmsg(65536, socket.CMSG_SPACE(28 * 4))
+            data, ancdata, flags, _addr = self.sock.recvmsg(65536, socket.CMSG_SPACE(28 * 4))
         except BlockingIOError:
             return
         except OSError as exc:
@@ -79,21 +81,38 @@ class InputMethod(QObject):
                 fds.frombytes(cdata[:len(cdata) - len(cdata) % fds.itemsize])
                 for f in fds:
                     os.close(f)
+        if flags & socket.MSG_CTRUNC:
+            log("input method: passed file descriptors were truncated")
         if not data:
-            log("input method connection closed by compositor")
-            self._notifier.setEnabled(False)
-            if self.context is not None:
-                self.context = None
-                self.focus_changed.emit(False)
+            self._close("input method connection closed by compositor")
             return
+        self.feed(data)
+
+    def feed(self, data):
+        """Split buffered wire data into messages and dispatch them."""
         self._buf += data
         while len(self._buf) >= 8:
             obj, word = struct.unpack_from("<II", self._buf)
             size, opcode = word >> 16, word & 0xFFFF
+            if size < 8 or size % 4:
+                self._close(f"input method: malformed message (object {obj}, size {size})")
+                return
             if len(self._buf) < size:
                 break
             body, self._buf = self._buf[8:size], self._buf[size:]
             self._dispatch(obj, opcode, body)
+
+    def _close(self, reason):
+        log(reason)
+        self._notifier.setEnabled(False)
+        self._buf = b""
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if self.context is not None:
+            self.context = None
+            self.focus_changed.emit(False)
 
     def _dispatch(self, obj, opcode, body):
         if obj == DISPLAY_ID:
@@ -124,8 +143,8 @@ class InputMethod(QObject):
                     log("text field unfocused")
                     self.focus_changed.emit(False)
         elif obj == self.context and opcode == 2:  # content_type(hint, purpose)
-            _hint, purpose = struct.unpack_from("<II", body)
+            hint, purpose = struct.unpack_from("<II", body)
             was = self.active
-            self.password = purpose == PURPOSE_PASSWORD
+            self.password = purpose == PURPOSE_PASSWORD or bool(hint & (HINT_HIDDEN_TEXT | HINT_SENSITIVE_DATA))
             if was != self.active:
                 self.focus_changed.emit(self.active)
